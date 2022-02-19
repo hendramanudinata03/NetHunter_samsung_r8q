@@ -590,6 +590,15 @@ config STACKDEPOT
 	bool
 	select STACKTRACE
 
+config STACK_HASH_ORDER_SHIFT
+	int "stack depot hash size (12 => 4KB, 20 => 1024KB)"
+	range 12 20
+	default 20
+	depends on STACKDEPOT
+	help
+	 Select the hash size as a power of 2 for the stackdepot hash table.
+	 Choose a lower value to reduce the memory impact.
+
 config SBITMAP
 	bool
 
@@ -601,6 +610,21 @@ config PRIME_NUMBERS
 
 config STRING_SELFTEST
 	tristate "Test string functions"
+
+config FFSI
+	bool
+	default y
+	help
+	  Library to support FFSI class as the realization of Elastic Capacity
+	  Vessel abstract theory.
+
+config SCHED_FFSI_GLUE
+	bool
+	depends on FFSI
+	default y
+	help
+	  Glue interface sticking edge of CFS scheduler and smoother governor
+	  working based on FFSI concept strategy.
 
 endmenu
 

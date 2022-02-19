@@ -60,12 +60,16 @@ struct sched_domain_attr {
 
 extern int sched_domain_level_max;
 
+unsigned long capacity_curr_of(int cpu);
+
 struct sched_group;
 
 struct sched_domain_shared {
 	atomic_t	ref;
 	atomic_t	nr_busy_cpus;
 	int		has_idle_cores;
+
+	bool            overutilized;
 };
 
 struct sched_domain {

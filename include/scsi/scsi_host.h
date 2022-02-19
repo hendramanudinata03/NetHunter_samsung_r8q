@@ -325,6 +325,7 @@ struct scsi_host_template {
 #define SCSI_ADAPTER_RESET	1
 #define SCSI_FIRMWARE_RESET	2
 
+        void (* tw_ctrl)(struct scsi_device *, int);
 
 	/*
 	 * Name of proc directory
@@ -658,6 +659,12 @@ struct Scsi_Host {
 	unsigned short_inquiry:1;
 
 	/*
+	 * Set "DBD" field in mode_sense caching mode page in case it is
+	 * mandatory by LLD standard.
+	 */
+	unsigned set_dbd_for_caching:1;
+
+	/*
 	 * Optional work queue to be utilized by the transport
 	 */
 	char work_q_name[20];
@@ -704,6 +711,24 @@ struct Scsi_Host {
 	 * Needed just in case we have virtual hosts.
 	 */
 	struct device *dma_dev;
+
+	unsigned int  by_ufs;
+#ifdef CONFIG_USB_STORAGE_DETECT
+	unsigned int  by_usb;
+#endif
+
+	unsigned int medium_err_cnt;
+	unsigned int hw_err_cnt;
+#define SEC_MAX_LBA_LOGGING	10
+#define SEC_ISSUE_REGION_STEP	(200*1024/4)	/* 200MB : 1 LBA = 4KB */
+	unsigned long issue_LBA_list[SEC_MAX_LBA_LOGGING];
+	unsigned int issue_LBA_count;
+	u64 issue_region_map;
+#if defined(CONFIG_UFS_DATA_LOG)
+	sector_t  ufs_system_start;
+	sector_t  ufs_system_end;
+	bool ufs_sys_log_en;
+#endif
 
 	/*
 	 * We should ensure that this is aligned, both for better performance
@@ -790,6 +815,9 @@ static inline int scsi_host_scan_allowed(struct Scsi_Host *shost)
 
 extern void scsi_unblock_requests(struct Scsi_Host *);
 extern void scsi_block_requests(struct Scsi_Host *);
+#ifdef CONFIG_BLK_TURBO_WRITE
+extern void scsi_reset_tw_state(struct Scsi_Host *);
+#endif
 
 struct class_container;
 

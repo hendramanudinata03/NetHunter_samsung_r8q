@@ -342,6 +342,9 @@ static int pci_call_probe(struct pci_driver *drv, struct pci_dev *dev,
 	node = dev_to_node(&dev->dev);
 	dev->is_probed = 1;
 
+#ifdef CONFIG_SEC_PCIE
+	dev->drv_probe_ready = 0;
+#endif
 	cpu_hotplug_disable();
 
 	/*
@@ -361,6 +364,11 @@ static int pci_call_probe(struct pci_driver *drv, struct pci_dev *dev,
 
 	dev->is_probed = 0;
 	cpu_hotplug_enable();
+
+#ifdef CONFIG_SEC_PCIE
+	dev->drv_probe_ready = !error;
+	dev_info(&dev->dev, "PCI probe function return:%d\n", dev->drv_probe_ready);
+#endif
 	return error;
 }
 
@@ -909,6 +917,9 @@ static int pci_pm_resume(struct device *dev)
 	const struct dev_pm_ops *pm = dev->driver ? dev->driver->pm : NULL;
 	int error = 0;
 
+	if (pci_dev->no_d3hot)
+		goto skip_pci_pm_restore;
+
 	/*
 	 * This is necessary for the suspend error path in which resume is
 	 * called without restoring the standard config registers of the device.
@@ -916,6 +927,7 @@ static int pci_pm_resume(struct device *dev)
 	if (pci_dev->state_saved)
 		pci_restore_standard_config(pci_dev);
 
+skip_pci_pm_restore:
 	if (pci_has_legacy_pm_support(pci_dev))
 		return pci_legacy_resume(dev);
 

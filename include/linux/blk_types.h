@@ -332,12 +332,17 @@ enum req_flag_bits {
 	__REQ_BACKGROUND,	/* background IO */
 	__REQ_NOWAIT,           /* Don't wait if request will block */
 
+	__REQ_SORTED = __REQ_RAHEAD, /* elevator knows about this request */
+	__REQ_URGENT,		/* urgent request */
 	/* command specific flags for REQ_OP_WRITE_ZEROES: */
 	__REQ_NOUNMAP,		/* do not free blocks when zeroing */
 
 	/* for driver use */
 	__REQ_DRV,
 	__REQ_SWAP,		/* swapping request. */
+	
+	/* HPB Flag */
+	__REQ_HPB_PREFER,
 	__REQ_NR_BITS,		/* stops here */
 };
 
@@ -347,6 +352,7 @@ enum req_flag_bits {
 #define REQ_SYNC		(1ULL << __REQ_SYNC)
 #define REQ_META		(1ULL << __REQ_META)
 #define REQ_PRIO		(1ULL << __REQ_PRIO)
+#define REQ_URGENT		(1ULL << __REQ_URGENT)
 #define REQ_NOMERGE		(1ULL << __REQ_NOMERGE)
 #define REQ_IDLE		(1ULL << __REQ_IDLE)
 #define REQ_INTEGRITY		(1ULL << __REQ_INTEGRITY)
@@ -360,6 +366,8 @@ enum req_flag_bits {
 
 #define REQ_DRV			(1ULL << __REQ_DRV)
 #define REQ_SWAP		(1ULL << __REQ_SWAP)
+
+#define REQ_HPB_PREFER		(1ULL << __REQ_HPB_PREFER)
 
 #define REQ_FAILFAST_MASK \
 	(REQ_FAILFAST_DEV | REQ_FAILFAST_TRANSPORT | REQ_FAILFAST_DRIVER)

@@ -42,7 +42,11 @@ struct fscrypt_name {
 #define fname_len(p)		((p)->disk_name.len)
 
 /* Maximum value for the third parameter of fscrypt_operations.set_context(). */
+#if defined(CONFIG_FSCRYPT_SDP) || defined(CONFIG_DDAR)
+#define FSCRYPT_SET_CONTEXT_MAX_SIZE	44
+#else
 #define FSCRYPT_SET_CONTEXT_MAX_SIZE	40
+#endif
 
 #ifdef CONFIG_FS_ENCRYPTION
 /*
@@ -58,6 +62,10 @@ struct fscrypt_operations {
 	const char *key_prefix;
 	int (*get_context)(struct inode *, void *, size_t);
 	int (*set_context)(struct inode *, const void *, size_t, void *);
+#if defined(CONFIG_DDAR) || defined(CONFIG_FSCRYPT_SDP)
+	int (*get_knox_context)(struct inode *, const char *, void *, size_t);
+	int (*set_knox_context)(struct inode *, const char *, const void *, size_t, void *);
+#endif
 	bool (*dummy_context)(struct inode *);
 	bool (*empty_dir)(struct inode *);
 	unsigned int max_namelen;
@@ -144,6 +152,7 @@ extern int fscrypt_d_revalidate(struct dentry *dentry, unsigned int flags);
 extern int fscrypt_ioctl_set_policy(struct file *, const void __user *);
 extern int fscrypt_ioctl_get_policy(struct file *, void __user *);
 extern int fscrypt_ioctl_get_policy_ex(struct file *, void __user *);
+extern int fscrypt_ioctl_get_nonce(struct file *filp, void __user *arg);
 extern int fscrypt_has_permitted_context(struct inode *, struct inode *);
 extern int fscrypt_inherit_context(struct inode *, struct inode *,
 					void *, bool);
@@ -162,6 +171,17 @@ extern int fscrypt_get_encryption_info(struct inode *);
 extern void fscrypt_put_encryption_info(struct inode *);
 extern void fscrypt_free_inode(struct inode *);
 extern int fscrypt_drop_inode(struct inode *inode);
+#ifdef CONFIG_FSCRYPT_SDP
+extern int fscrypt_get_encryption_key(
+						struct fscrypt_info *crypt_info,
+						struct fscrypt_key *key);
+extern int fscrypt_get_encryption_key_classified(
+						struct fscrypt_info *crypt_info,
+						struct fscrypt_key *key);
+extern int fscrypt_get_encryption_kek(
+						struct fscrypt_info *crypt_info,
+						struct fscrypt_key *kek);
+#endif
 
 /* fname.c */
 extern int fscrypt_setup_filename(struct inode *, const struct qstr *,
@@ -211,6 +231,21 @@ extern int __fscrypt_encrypt_symlink(struct inode *inode, const char *target,
 extern const char *fscrypt_get_symlink(struct inode *inode, const void *caddr,
 				       unsigned int max_size,
 				       struct delayed_call *done);
+
+#ifdef CONFIG_DDAR
+extern int fscrypt_dd_decrypt_page(struct inode *inode, struct page *page);
+extern int fscrypt_dd_encrypted(struct bio *bio);
+extern int fscrypt_dd_encrypted_inode(const struct inode *inode);
+extern int fscrypt_dd_is_traced_inode(const struct inode *inode);
+extern void fscrypt_dd_trace_inode(const struct inode *inode);
+extern long fscrypt_dd_get_ino(struct bio *bio);
+extern long fscrypt_dd_ioctl(unsigned int cmd, unsigned long *arg, struct inode *inode);
+extern int fscrypt_dd_submit_bio(struct inode *inode, struct bio *bio);
+extern int fscrypt_dd_may_submit_bio(struct bio *bio);
+extern struct inode *fscrypt_bio_get_inode(const struct bio *bio);
+extern bool fscrypt_dd_can_merge_bio(struct bio *bio, struct address_space *mapping);
+#endif
+
 #else  /* !CONFIG_FS_ENCRYPTION */
 
 static inline bool fscrypt_has_encryption_key(const struct inode *inode)
@@ -302,6 +337,11 @@ static inline int fscrypt_ioctl_get_policy_ex(struct file *filp,
 	return -EOPNOTSUPP;
 }
 
+static inline int fscrypt_ioctl_get_nonce(struct file *filp, void __user *arg)
+{
+	return -EOPNOTSUPP;
+}
+
 static inline int fscrypt_has_permitted_context(struct inode *parent,
 						struct inode *child)
 {
@@ -372,6 +412,27 @@ static inline void fscrypt_free_inode(struct inode *inode)
 static inline int fscrypt_drop_inode(struct inode *inode)
 {
 	return 0;
+}
+
+static inline int fscrypt_get_encryption_key(
+						struct fscrypt_info *crypt_info,
+						struct fscrypt_key *key)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int fscrypt_get_encryption_key_classified(
+						struct fscrypt_info *crypt_info,
+						struct fscrypt_key *key)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int fscrypt_get_encryption_kek(
+						struct fscrypt_info *crypt_info,
+						struct fscrypt_key *kek)
+{
+	return -EOPNOTSUPP;
 }
 
  /* fname.c */
@@ -525,6 +586,11 @@ extern bool fscrypt_mergeable_bio(struct bio *bio, const struct inode *inode,
 extern bool fscrypt_mergeable_bio_bh(struct bio *bio,
 				     const struct buffer_head *next_bh);
 
+bool fscrypt_dio_supported(struct kiocb *iocb, struct iov_iter *iter);
+
+int fscrypt_limit_dio_pages(const struct inode *inode, loff_t pos,
+			    int nr_pages);
+
 #else /* CONFIG_FS_ENCRYPTION_INLINE_CRYPT */
 static inline bool fscrypt_inode_uses_inline_crypto(const struct inode *inode)
 {
@@ -556,6 +622,20 @@ static inline bool fscrypt_mergeable_bio_bh(struct bio *bio,
 					    const struct buffer_head *next_bh)
 {
 	return true;
+}
+
+static inline bool fscrypt_dio_supported(struct kiocb *iocb,
+					 struct iov_iter *iter)
+{
+	const struct inode *inode = file_inode(iocb->ki_filp);
+
+	return !fscrypt_needs_contents_encryption(inode);
+}
+
+static inline int fscrypt_limit_dio_pages(const struct inode *inode, loff_t pos,
+					  int nr_pages)
+{
+	return nr_pages;
 }
 #endif /* !CONFIG_FS_ENCRYPTION_INLINE_CRYPT */
 
@@ -792,5 +872,4 @@ static inline void fscrypt_finalize_bounce_page(struct page **pagep)
 		fscrypt_free_bounce_page(page);
 	}
 }
-
 #endif	/* _LINUX_FSCRYPT_H */

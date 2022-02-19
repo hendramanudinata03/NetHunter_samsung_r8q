@@ -38,6 +38,7 @@
 #include <linux/kasan.h>
 
 #include <asm/atomic.h>
+#include <asm/barrier.h>
 #include <asm/bug.h>
 #include <asm/cpufeature.h>
 #include <asm/daifflags.h>
@@ -52,6 +53,12 @@
 #include <asm/system_misc.h>
 #include <asm/sysreg.h>
 
+#include <linux/sec_debug.h>
+
+#ifdef CONFIG_CFP_ROPP
+#include <linux/cfp.h>
+#endif
+
 static const char *handler[]= {
 	"Synchronous Abort",
 	"IRQ",
@@ -60,6 +67,57 @@ static const char *handler[]= {
 };
 
 int show_unhandled_signals = 0;
+
+#ifdef CONFIG_SEC_DEBUG
+/*
+ * Dump out the contents of some kernel memory nicely...
+ */
+static void dump_mem(const char *lvl, const char *str, unsigned long bottom,
+		     unsigned long top)
+{
+	unsigned long first;
+	mm_segment_t fs;
+	int i;
+
+	/*
+	 * We need to switch to kernel mode so that we can use __get_user
+	 * to safely read from kernel space.
+	 */
+	fs = get_fs();
+	set_fs(KERNEL_DS);
+
+	printk("%s%s(0x%016lx to 0x%016lx)\n", lvl, str, bottom, top);
+
+	if (!IS_ENABLED(CONFIG_SEC_DEBUG_DUMP_TASK_STACK)) {
+		pr_warn("CONFIG_SEC_DEBUG_DUMP_TASK_STACK is not enabled!\n");
+		goto done;
+	}
+
+	for (first = bottom & ~31; first < top; first += 32) {
+		unsigned long p;
+		char str[sizeof(" 12345678") * 8 + 1];
+
+		memset(str, ' ', sizeof(str));
+		str[sizeof(str) - 1] = '\0';
+
+		for (p = first, i = 0; i < (32 / 8)
+					&& p < top; i++, p += 8) {
+			if (p >= bottom && p < top) {
+				unsigned long val;
+
+				if (__get_user(val, (unsigned long *)p) == 0)
+					sprintf(str + i * 17, " %016lx", val);
+				else
+					sprintf(str + i * 17, " ????????????????");
+			}
+		}
+		printk("%s%04lx:%s\n", lvl, first & 0xffff, str);
+	}
+
+done:
+	set_fs(fs);
+}
+#endif
 
 static void dump_backtrace_entry(unsigned long where)
 {
@@ -103,6 +161,16 @@ void dump_backtrace(struct pt_regs *regs, struct task_struct *tsk)
 {
 	struct stackframe frame;
 	int skip = 0;
+	long cur_state = 0;
+	unsigned long cur_sp = 0;
+	unsigned long cur_fp = 0;
+
+#if (defined CONFIG_CFP_ROPP) && (defined CONFIG_CFP_TEST)
+	unsigned long value = 0x0;
+#endif
+#ifdef CONFIG_SEC_DEBUG
+	unsigned long prev_fp = 0;
+#endif
 
 	pr_debug("%s(regs = %p tsk = %p)\n", __func__, regs, tsk);
 
@@ -118,6 +186,11 @@ void dump_backtrace(struct pt_regs *regs, struct task_struct *tsk)
 	if (!try_get_task_stack(tsk))
 		return;
 
+#if (defined CONFIG_CFP_ROPP) && (defined CONFIG_CFP_TEST)
+	asm volatile("mrs %0, "STR(RRMK)"\n\t" : "=r" (value));
+	printk("CFP_TEST MK= %lx RRK=%lx RRK^MK=%lx\n", value, task_thread_info(tsk)->rrk, task_thread_info(tsk)->rrk ^ value);
+#endif
+
 	if (tsk == current) {
 		frame.fp = (unsigned long)__builtin_frame_address(0);
 		frame.pc = (unsigned long)dump_backtrace;
@@ -127,6 +200,9 @@ void dump_backtrace(struct pt_regs *regs, struct task_struct *tsk)
 		 */
 		frame.fp = thread_saved_fp(tsk);
 		frame.pc = thread_saved_pc(tsk);
+		cur_state = tsk->state;
+		cur_sp = thread_saved_sp(tsk);
+		cur_fp = frame.fp;
 	}
 #ifdef CONFIG_FUNCTION_GRAPH_TRACER
 	frame.graph = tsk->curr_ret_stack;
@@ -134,6 +210,23 @@ void dump_backtrace(struct pt_regs *regs, struct task_struct *tsk)
 
 	printk("Call trace:\n");
 	do {
+		if (tsk != current && (cur_state != tsk->state
+			/*
+			 * We would not be printing backtrace for the task
+			 * that has changed state from uninterruptible to
+			 * running before hitting the do-while loop but after
+			 * saving the current state. If task is in running
+			 * state before saving the state, then we may print
+			 * wrong call trace or end up in infinite while loop
+			 * if *(fp) and *(fp+8) are same. While the situation
+			 * will stop print when that task schedule out.
+			 */
+			|| cur_sp != thread_saved_sp(tsk)
+			|| cur_fp != thread_saved_fp(tsk))) {
+			printk("The task:%s had been rescheduled!\n",
+				tsk->comm);
+			break;
+		}
 		/* skip until specified stack frame */
 		if (!skip) {
 			dump_backtrace_entry(frame.pc);
@@ -148,6 +241,17 @@ void dump_backtrace(struct pt_regs *regs, struct task_struct *tsk)
 			 */
 			dump_backtrace_entry(regs->pc);
 		}
+
+#ifdef CONFIG_SEC_DEBUG
+		if (prev_fp >= frame.fp) {
+			if (on_accessible_stack(tsk, frame.fp, NULL)) {
+				printk("FP looks invalid : 0x%016lx state(0x%016lx) on_cpu(%d)@cpu%u\n",
+						frame.fp, tsk->state, tsk->on_cpu, tsk->cpu);
+			}
+			break;
+		}
+		prev_fp = frame.fp;
+#endif
 	} while (!unwind_frame(tsk, &frame));
 
 	put_task_stack(tsk);
@@ -186,8 +290,24 @@ static int __die(const char *str, int err, struct pt_regs *regs)
 		 end_of_stack(tsk));
 	show_regs(regs);
 
-	if (!user_mode(regs))
+	if (!user_mode(regs)) {
+#ifdef CONFIG_SEC_DEBUG
+		unsigned long bottom = regs->sp;
+		if (!object_is_on_stack((void *)bottom)) {
+			unsigned long irq_stack =
+				(unsigned long)this_cpu_read(irq_stack_ptr);
+			if ((irq_stack <= bottom) &&
+			    (bottom < irq_stack + IRQ_STACK_SIZE))
+				dump_mem(KERN_EMERG, "Stack: ", bottom,
+					 irq_stack + IRQ_STACK_SIZE);
+			bottom = (unsigned long)task_stack_page(tsk);
+		}
+		dump_mem(KERN_EMERG, "Stack: ", bottom,
+			 THREAD_SIZE + (unsigned long)task_stack_page(tsk));
+		dump_backtrace(regs, tsk);
+#endif
 		dump_instr(KERN_EMERG, regs);
+	}
 
 	return ret;
 }
@@ -206,6 +326,10 @@ void die(const char *str, struct pt_regs *regs, int err)
 
 	oops_enter();
 
+	sec_debug_sched_msg("!!die!!");
+	sec_debug_sched_msg("!!die!!");
+
+	sec_debug_summary_save_die_info(str, regs);
 	console_verbose();
 	bust_spinlocks(1);
 	ret = __die(str, err, regs);
@@ -491,6 +615,7 @@ static void cntvct_read_handler(unsigned int esr, struct pt_regs *regs)
 {
 	int rt = (esr & ESR_ELx_SYS64_ISS_RT_MASK) >> ESR_ELx_SYS64_ISS_RT_SHIFT;
 
+	isb();
 	pt_regs_write_reg(regs, rt, arch_counter_get_cntvct());
 	arm64_skip_faulting_instruction(regs, AARCH64_INSN_SIZE);
 }
@@ -535,6 +660,161 @@ static struct sys64_hook sys64_hooks[] = {
 	},
 	{},
 };
+
+
+#ifdef CONFIG_COMPAT
+#define PSTATE_IT_1_0_SHIFT	25
+#define PSTATE_IT_1_0_MASK	(0x3 << PSTATE_IT_1_0_SHIFT)
+#define PSTATE_IT_7_2_SHIFT	10
+#define PSTATE_IT_7_2_MASK	(0x3f << PSTATE_IT_7_2_SHIFT)
+
+static u32 compat_get_it_state(struct pt_regs *regs)
+{
+	u32 it, pstate = regs->pstate;
+
+	it  = (pstate & PSTATE_IT_1_0_MASK) >> PSTATE_IT_1_0_SHIFT;
+	it |= ((pstate & PSTATE_IT_7_2_MASK) >> PSTATE_IT_7_2_SHIFT) << 2;
+
+	return it;
+}
+
+static void compat_set_it_state(struct pt_regs *regs, u32 it)
+{
+	u32 pstate_it;
+
+	pstate_it  = (it << PSTATE_IT_1_0_SHIFT) & PSTATE_IT_1_0_MASK;
+	pstate_it |= ((it >> 2) << PSTATE_IT_7_2_SHIFT) & PSTATE_IT_7_2_MASK;
+
+	regs->pstate &= ~PSR_AA32_IT_MASK;
+	regs->pstate |= pstate_it;
+}
+
+static bool cp15_cond_valid(unsigned int esr, struct pt_regs *regs)
+{
+	int cond;
+
+	/* Only a T32 instruction can trap without CV being set */
+	if (!(esr & ESR_ELx_CV)) {
+		u32 it;
+
+		it = compat_get_it_state(regs);
+		if (!it)
+			return true;
+
+		cond = it >> 4;
+	} else {
+		cond = (esr & ESR_ELx_COND_MASK) >> ESR_ELx_COND_SHIFT;
+	}
+
+	return aarch32_opcode_cond_checks[cond](regs->pstate);
+}
+
+static void advance_itstate(struct pt_regs *regs)
+{
+	u32 it;
+
+	/* ARM mode */
+	if (!(regs->pstate & PSR_AA32_T_BIT) ||
+	    !(regs->pstate & PSR_AA32_IT_MASK))
+		return;
+
+	it  = compat_get_it_state(regs);
+
+	/*
+	 * If this is the last instruction of the block, wipe the IT
+	 * state. Otherwise advance it.
+	 */
+	if (!(it & 7))
+		it = 0;
+	else
+		it = (it & 0xe0) | ((it << 1) & 0x1f);
+
+	compat_set_it_state(regs, it);
+}
+
+static void arm64_compat_skip_faulting_instruction(struct pt_regs *regs,
+						   unsigned int sz)
+{
+	advance_itstate(regs);
+	arm64_skip_faulting_instruction(regs, sz);
+}
+
+static void compat_cntfrq_read_handler(unsigned int esr, struct pt_regs *regs)
+{
+	int reg = (esr & ESR_ELx_CP15_32_ISS_RT_MASK) >> ESR_ELx_CP15_32_ISS_RT_SHIFT;
+
+	pt_regs_write_reg(regs, reg, arch_timer_get_rate());
+	arm64_compat_skip_faulting_instruction(regs, 4);
+}
+
+static struct sys64_hook cp15_32_hooks[] = {
+	{
+		.esr_mask = ESR_ELx_CP15_32_ISS_SYS_MASK,
+		.esr_val = ESR_ELx_CP15_32_ISS_SYS_CNTFRQ,
+		.handler = compat_cntfrq_read_handler,
+	},
+	{},
+};
+
+static void compat_cntvct_read_handler(unsigned int esr, struct pt_regs *regs)
+{
+	int rt = (esr & ESR_ELx_CP15_64_ISS_RT_MASK) >> ESR_ELx_CP15_64_ISS_RT_SHIFT;
+	int rt2 = (esr & ESR_ELx_CP15_64_ISS_RT2_MASK) >> ESR_ELx_CP15_64_ISS_RT2_SHIFT;
+	u64 val = arch_counter_get_cntvct();
+
+	pt_regs_write_reg(regs, rt, lower_32_bits(val));
+	pt_regs_write_reg(regs, rt2, upper_32_bits(val));
+	arm64_compat_skip_faulting_instruction(regs, 4);
+}
+
+static struct sys64_hook cp15_64_hooks[] = {
+	{
+		.esr_mask = ESR_ELx_CP15_64_ISS_SYS_MASK,
+		.esr_val = ESR_ELx_CP15_64_ISS_SYS_CNTVCT,
+		.handler = compat_cntvct_read_handler,
+	},
+	{},
+};
+
+asmlinkage void __exception do_cp15instr(unsigned int esr, struct pt_regs *regs)
+{
+	struct sys64_hook *hook, *hook_base;
+
+	if (!cp15_cond_valid(esr, regs)) {
+		/*
+		 * There is no T16 variant of a CP access, so we
+		 * always advance PC by 4 bytes.
+		 */
+		arm64_compat_skip_faulting_instruction(regs, 4);
+		return;
+	}
+
+	switch (ESR_ELx_EC(esr)) {
+	case ESR_ELx_EC_CP15_32:
+		hook_base = cp15_32_hooks;
+		break;
+	case ESR_ELx_EC_CP15_64:
+		hook_base = cp15_64_hooks;
+		break;
+	default:
+		do_undefinstr(regs);
+		return;
+	}
+
+	for (hook = hook_base; hook->handler; hook++)
+		if ((hook->esr_mask & esr) == hook->esr_val) {
+			hook->handler(esr, regs);
+			return;
+		}
+
+	/*
+	 * New cp15 instructions may previously have been undefined at
+	 * EL0. Fall back to our usual undefined instruction handler
+	 * so that we handle these consistently.
+	 */
+	do_undefinstr(regs);
+}
+#endif
 
 asmlinkage void __exception do_sysinstr(unsigned int esr, struct pt_regs *regs)
 {
@@ -607,6 +887,9 @@ const char *esr_get_class_string(u32 esr)
 asmlinkage void bad_mode(struct pt_regs *regs, int reason, unsigned int esr)
 {
 	console_verbose();
+
+	sec_debug_save_badmode_info(reason, handler[reason],
+			esr, esr_get_class_string(esr));
 
 	pr_crit("Bad mode in %s handler detected on CPU%d, code 0x%08x -- %s\n",
 		handler[reason], smp_processor_id(), esr,

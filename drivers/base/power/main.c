@@ -464,7 +464,7 @@ static void dpm_show_time(ktime_t starttime, pm_message_t state, int error,
 	if (usecs == 0)
 		usecs = 1;
 
-	pm_pr_dbg("%s%s%s of devices %s after %ld.%03ld msecs\n",
+	pr_info("PM: %s%s%s of devices %s after %ld.%03ld msecs\n",
 		  info ?: "", info ? " " : "", pm_verb(state.event),
 		  error ? "aborted" : "complete",
 		  usecs / USEC_PER_MSEC, usecs % USEC_PER_MSEC);
@@ -1769,6 +1769,9 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
 		pm_wakeup_event(dev, 0);
 
 	if (pm_wakeup_pending()) {
+		pm_get_active_wakeup_sources(suspend_abort,
+			MAX_SUSPEND_ABORT_LEN);
+		log_suspend_abort_reason(suspend_abort);
 		dev->power.direct_complete = false;
 		pm_get_active_wakeup_sources(suspend_abort,
 			MAX_SUSPEND_ABORT_LEN);

@@ -46,6 +46,7 @@ static void free_master_key(struct fscrypt_master_key *mk)
 	for (i = 0; i <= __FSCRYPT_MODE_MAX; i++) {
 		fscrypt_destroy_prepared_key(&mk->mk_direct_keys[i]);
 		fscrypt_destroy_prepared_key(&mk->mk_iv_ino_lblk_64_keys[i]);
+		fscrypt_destroy_prepared_key(&mk->mk_iv_ino_lblk_32_keys[i]);
 	}
 
 	key_put(mk->mk_users);
@@ -652,7 +653,7 @@ int fscrypt_ioctl_add_key(struct file *filp, void __user *_uarg)
 			goto out_wipe_secret;
 
 		err = -EINVAL;
-		if (arg.__flags)
+		if (arg.__flags & ~__FSCRYPT_ADD_KEY_FLAG_HW_WRAPPED)
 			goto out_wipe_secret;
 		break;
 	case FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER:

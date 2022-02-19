@@ -5,6 +5,8 @@
 #ifndef __LINUX_BIO_CRYPT_CTX_H
 #define __LINUX_BIO_CRYPT_CTX_H
 
+#include <linux/string.h>
+
 enum blk_crypto_mode_num {
 	BLK_ENCRYPTION_MODE_INVALID,
 	BLK_ENCRYPTION_MODE_AES_256_XTS,
@@ -43,13 +45,41 @@ struct blk_crypto_key {
 	unsigned int data_unit_size;
 	unsigned int data_unit_size_bits;
 	unsigned int size;
+
+	/*
+	 * Hack to avoid breaking KMI: pack both hash and dun_bytes into the
+	 * hash field...
+	 */
+#define BLK_CRYPTO_KEY_HASH_MASK		0xffffff
+#define BLK_CRYPTO_KEY_DUN_BYTES_SHIFT		24
 	unsigned int hash;
+
 	bool is_hw_wrapped;
 	u8 raw[BLK_CRYPTO_MAX_WRAPPED_KEY_SIZE];
 };
 
 #define BLK_CRYPTO_MAX_IV_SIZE		32
 #define BLK_CRYPTO_DUN_ARRAY_SIZE	(BLK_CRYPTO_MAX_IV_SIZE/sizeof(u64))
+
+static inline void
+blk_crypto_key_set_hash_and_dun_bytes(struct blk_crypto_key *key,
+				      u32 hash, unsigned int dun_bytes)
+{
+	key->hash = (dun_bytes << BLK_CRYPTO_KEY_DUN_BYTES_SHIFT) |
+		    (hash & BLK_CRYPTO_KEY_HASH_MASK);
+}
+
+static inline u32
+blk_crypto_key_hash(const struct blk_crypto_key *key)
+{
+	return key->hash & BLK_CRYPTO_KEY_HASH_MASK;
+}
+
+static inline unsigned int
+blk_crypto_key_dun_bytes(const struct blk_crypto_key *key)
+{
+	return key->hash >> BLK_CRYPTO_KEY_DUN_BYTES_SHIFT;
+}
 
 /**
  * struct bio_crypt_ctx - an inline encryption context
@@ -76,6 +106,7 @@ struct bio_crypt_ctx {
 	 * with keyslot.
 	 */
 	struct keyslot_manager		*bc_ksm;
+	bool is_ext4;
 };
 
 int bio_crypt_ctx_init(void);

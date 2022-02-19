@@ -40,6 +40,26 @@ void page_writeback_init(void);
 
 vm_fault_t do_swap_page(struct vm_fault *vmf);
 
+#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
+extern struct vm_area_struct *get_vma(struct mm_struct *mm,
+				      unsigned long addr);
+extern void put_vma(struct vm_area_struct *vma);
+
+static inline bool vma_has_changed(struct vm_fault *vmf)
+{
+	int ret = RB_EMPTY_NODE(&vmf->vma->vm_rb);
+	unsigned int seq = READ_ONCE(vmf->vma->vm_sequence.sequence);
+
+	/*
+	 * Matches both the wmb in write_seqlock_{begin,end}() and
+	 * the wmb in vma_rb_erase().
+	 */
+	smp_rmb();
+
+	return ret || seq != vmf->sequence;
+}
+#endif /* CONFIG_SPECULATIVE_PAGE_FAULT */
+
 void free_pgtables(struct mmu_gather *tlb, struct vm_area_struct *start_vma,
 		unsigned long floor, unsigned long ceiling);
 
@@ -183,14 +203,16 @@ extern int user_min_free_kbytes;
 struct compact_control {
 	struct list_head freepages;	/* List of free pages to migrate to */
 	struct list_head migratepages;	/* List of pages being migrated */
-	struct zone *zone;
-	unsigned long nr_freepages;	/* Number of isolated free pages */
-	unsigned long nr_migratepages;	/* Number of pages to migrate */
-	unsigned long total_migrate_scanned;
-	unsigned long total_free_scanned;
+	unsigned int nr_freepages;	/* Number of isolated free pages */
+	unsigned int nr_migratepages;	/* Number of pages to migrate */
 	unsigned long free_pfn;		/* isolate_freepages search base */
 	unsigned long migrate_pfn;	/* isolate_migratepages search base */
-	unsigned long last_migrated_pfn;/* Not yet flushed page being freed */
+	unsigned long fast_start_pfn;	/* a pfn to start linear scan from */
+	struct zone *zone;
+	unsigned long total_migrate_scanned;
+	unsigned long total_free_scanned;
+	unsigned short fast_search_fail;/* failures to use free list searches */
+	short search_order;		/* order to start a fast search at */
 	const gfp_t gfp_mask;		/* gfp mask of a direct compactor */
 	int order;			/* order a direct compactor needs */
 	int migratetype;		/* migratetype of direct compactor */
@@ -203,7 +225,16 @@ struct compact_control {
 	bool direct_compaction;		/* False from kcompactd or /proc/... */
 	bool whole_zone;		/* Whole zone should/has been scanned */
 	bool contended;			/* Signal lock or sched contention */
-	bool finishing_block;		/* Finishing current pageblock */
+	bool rescan;			/* Rescanning the same pageblock */
+};
+
+/*
+ * Used in direct compaction when a page should be taken from the freelists
+ * immediately when one is created during the free path.
+ */
+struct capture_control {
+	struct compact_control *cc;
+	struct page *page;
 };
 
 unsigned long
@@ -543,4 +574,17 @@ static inline bool is_migrate_highatomic_page(struct page *page)
 
 void setup_zone_pageset(struct zone *zone);
 extern struct page *alloc_new_node_page(struct page *page, unsigned long node);
+
+#ifdef CONFIG_HUGEPAGE_POOL
+#include <linux/hugepage_pool.h>
+static inline struct page *alloc_from_hugepage_pool(gfp_t gfp_mask,
+		struct vm_area_struct *vma, unsigned long addr, int order) {
+	return alloc_zeroed_hugepage(gfp_mask, order, false, HPAGE_ANON);
+}
+extern void ___free_pages_ok(struct page *page, unsigned int order,
+			     bool skip_hugepage_pool);
+extern void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags,
+						unsigned int alloc_flags);
+void compact_node_async(void);
+#endif
 #endif	/* __MM_INTERNAL_H */

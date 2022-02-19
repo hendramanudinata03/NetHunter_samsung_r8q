@@ -22,6 +22,9 @@
 #include <linux/compiler.h>
 
 #include "internal.h"
+#ifdef CONFIG_CRYPTO_FIPS /* FIPS_140_2 */
+#include "fips140.h"
+#endif
 
 static const struct crypto_type crypto_shash_type;
 
@@ -82,13 +85,6 @@ int crypto_shash_setkey(struct crypto_shash *tfm, const u8 *key,
 }
 EXPORT_SYMBOL_GPL(crypto_shash_setkey);
 
-static inline unsigned int shash_align_buffer_size(unsigned len,
-						   unsigned long mask)
-{
-	typedef u8 __aligned_largest u8_aligned;
-	return len + (mask & ~(__alignof__(u8_aligned) - 1));
-}
-
 static int shash_update_unaligned(struct shash_desc *desc, const u8 *data,
 				  unsigned int len)
 {
@@ -97,10 +93,16 @@ static int shash_update_unaligned(struct shash_desc *desc, const u8 *data,
 	unsigned long alignmask = crypto_shash_alignmask(tfm);
 	unsigned int unaligned_len = alignmask + 1 -
 				     ((unsigned long)data & alignmask);
-	u8 ubuf[shash_align_buffer_size(unaligned_len, alignmask)]
-		__aligned_largest;
+	/*
+	 * We cannot count on __aligned() working for large values:
+	 * https://patchwork.kernel.org/patch/9507697/
+	 */
+	u8 ubuf[MAX_ALGAPI_ALIGNMASK * 2];
 	u8 *buf = PTR_ALIGN(&ubuf[0], alignmask + 1);
 	int err;
+
+	if (WARN_ON(buf + unaligned_len > ubuf + sizeof(ubuf)))
+		return -EINVAL;
 
 	if (unaligned_len > len)
 		unaligned_len = len;
@@ -120,6 +122,11 @@ int crypto_shash_update(struct shash_desc *desc, const u8 *data,
 	struct shash_alg *shash = crypto_shash_alg(tfm);
 	unsigned long alignmask = crypto_shash_alignmask(tfm);
 
+#ifdef CONFIG_CRYPTO_FIPS /* FIPS_140_2 */
+	if (unlikely(in_fips_err()))
+		return -EACCES;
+#endif
+
 	if ((unsigned long)data & alignmask)
 		return shash_update_unaligned(desc, data, len);
 
@@ -133,10 +140,16 @@ static int shash_final_unaligned(struct shash_desc *desc, u8 *out)
 	unsigned long alignmask = crypto_shash_alignmask(tfm);
 	struct shash_alg *shash = crypto_shash_alg(tfm);
 	unsigned int ds = crypto_shash_digestsize(tfm);
-	u8 ubuf[shash_align_buffer_size(ds, alignmask)]
-		__aligned_largest;
+	/*
+	 * We cannot count on __aligned() working for large values:
+	 * https://patchwork.kernel.org/patch/9507697/
+	 */
+	u8 ubuf[MAX_ALGAPI_ALIGNMASK + HASH_MAX_DIGESTSIZE];
 	u8 *buf = PTR_ALIGN(&ubuf[0], alignmask + 1);
 	int err;
+
+	if (WARN_ON(buf + ds > ubuf + sizeof(ubuf)))
+		return -EINVAL;
 
 	err = shash->final(desc, buf);
 	if (err)
@@ -154,6 +167,11 @@ int crypto_shash_final(struct shash_desc *desc, u8 *out)
 	struct crypto_shash *tfm = desc->tfm;
 	struct shash_alg *shash = crypto_shash_alg(tfm);
 	unsigned long alignmask = crypto_shash_alignmask(tfm);
+
+#ifdef CONFIG_CRYPTO_FIPS /* FIPS_140_2 */
+	if (unlikely(in_fips_err()))
+		return -EACCES;
+#endif
 
 	if ((unsigned long)out & alignmask)
 		return shash_final_unaligned(desc, out);
@@ -176,6 +194,11 @@ int crypto_shash_finup(struct shash_desc *desc, const u8 *data,
 	struct shash_alg *shash = crypto_shash_alg(tfm);
 	unsigned long alignmask = crypto_shash_alignmask(tfm);
 
+#ifdef CONFIG_CRYPTO_FIPS /* FIPS_140_2 */
+	if (unlikely(in_fips_err()))
+		return -EACCES;
+#endif
+
 	if (((unsigned long)data | (unsigned long)out) & alignmask)
 		return shash_finup_unaligned(desc, data, len, out);
 
@@ -196,6 +219,11 @@ int crypto_shash_digest(struct shash_desc *desc, const u8 *data,
 	struct crypto_shash *tfm = desc->tfm;
 	struct shash_alg *shash = crypto_shash_alg(tfm);
 	unsigned long alignmask = crypto_shash_alignmask(tfm);
+
+#ifdef CONFIG_CRYPTO_FIPS /* FIPS_140_2 */
+	if (unlikely(in_fips_err()))
+		return -EACCES;
+#endif
 
 	if (crypto_shash_get_flags(tfm) & CRYPTO_TFM_NEED_KEY)
 		return -ENOKEY;
@@ -232,6 +260,11 @@ static int shash_async_init(struct ahash_request *req)
 	struct crypto_shash **ctx = crypto_ahash_ctx(crypto_ahash_reqtfm(req));
 	struct shash_desc *desc = ahash_request_ctx(req);
 
+#ifdef CONFIG_CRYPTO_FIPS /* FIPS_140_2 */
+	if (unlikely(in_fips_err()))
+		return -EACCES;
+#endif
+
 	desc->tfm = *ctx;
 	desc->flags = req->base.flags;
 
@@ -242,6 +275,11 @@ int shash_ahash_update(struct ahash_request *req, struct shash_desc *desc)
 {
 	struct crypto_hash_walk walk;
 	int nbytes;
+
+#ifdef CONFIG_CRYPTO_FIPS /* FIPS_140_2 */
+	if (unlikely(in_fips_err()))
+		return -EACCES;
+#endif
 
 	for (nbytes = crypto_hash_walk_first(req, &walk); nbytes > 0;
 	     nbytes = crypto_hash_walk_done(&walk, nbytes))
@@ -265,6 +303,11 @@ int shash_ahash_finup(struct ahash_request *req, struct shash_desc *desc)
 {
 	struct crypto_hash_walk walk;
 	int nbytes;
+
+#ifdef CONFIG_CRYPTO_FIPS /* FIPS_140_2 */
+	if (unlikely(in_fips_err()))
+		return -EACCES;
+#endif
 
 	nbytes = crypto_hash_walk_first(req, &walk);
 	if (!nbytes)
@@ -299,6 +342,11 @@ int shash_ahash_digest(struct ahash_request *req, struct shash_desc *desc)
 	struct scatterlist *sg;
 	unsigned int offset;
 	int err;
+
+#ifdef CONFIG_CRYPTO_FIPS /* FIPS_140_2 */
+	if (unlikely(in_fips_err()))
+		return -EACCES;
+#endif
 
 	if (nbytes &&
 	    (sg = req->src, offset = sg->offset,
@@ -359,6 +407,11 @@ int crypto_init_shash_ops_async(struct crypto_tfm *tfm)
 	struct crypto_ahash *crt = __crypto_ahash_cast(tfm);
 	struct crypto_shash **ctx = crypto_tfm_ctx(tfm);
 	struct crypto_shash *shash;
+
+#ifdef CONFIG_CRYPTO_FIPS /* FIPS_140_2 */
+	if (unlikely(in_fips_err()))
+		return -EACCES;
+#endif
 
 	if (!crypto_mod_get(calg))
 		return -EAGAIN;
@@ -466,9 +519,9 @@ static int shash_prepare_alg(struct shash_alg *alg)
 {
 	struct crypto_alg *base = &alg->base;
 
-	if (alg->digestsize > PAGE_SIZE / 8 ||
-	    alg->descsize > PAGE_SIZE / 8 ||
-	    alg->statesize > PAGE_SIZE / 8)
+	if (alg->digestsize > HASH_MAX_DIGESTSIZE ||
+	    alg->descsize > HASH_MAX_DESCSIZE ||
+	    alg->statesize > HASH_MAX_STATESIZE)
 		return -EINVAL;
 
 	base->cra_type = &crypto_shash_type;
@@ -494,6 +547,11 @@ int crypto_register_shash(struct shash_alg *alg)
 {
 	struct crypto_alg *base = &alg->base;
 	int err;
+
+#ifdef CONFIG_CRYPTO_FIPS /* FIPS_140_2 */
+	if (unlikely(in_fips_err()))
+		return -EACCES;
+#endif
 
 	err = shash_prepare_alg(alg);
 	if (err)
@@ -550,6 +608,11 @@ int shash_register_instance(struct crypto_template *tmpl,
 {
 	int err;
 
+#ifdef CONFIG_CRYPTO_FIPS /* FIPS_140_2 */
+	if (unlikely(in_fips_err()))
+		return -EACCES;
+#endif
+
 	err = shash_prepare_alg(&inst->alg);
 	if (err)
 		return err;
@@ -569,6 +632,11 @@ int crypto_init_shash_spawn(struct crypto_shash_spawn *spawn,
 			    struct shash_alg *alg,
 			    struct crypto_instance *inst)
 {
+#ifdef CONFIG_CRYPTO_FIPS /* FIPS_140_2 */
+	if (unlikely(in_fips_err()))
+		return -EACCES;
+#endif
+
 	return crypto_init_spawn2(&spawn->base, &alg->base, inst,
 				  &crypto_shash_type);
 }

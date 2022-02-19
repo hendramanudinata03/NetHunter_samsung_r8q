@@ -68,6 +68,11 @@ unsigned long __stack_chk_guard __read_mostly;
 EXPORT_SYMBOL(__stack_chk_guard);
 #endif
 
+#ifdef CONFIG_CFP_ROPP
+#include <linux/cfp.h>
+#define RRK_MASK (1UL << 63)
+#endif
+
 /*
  * Function pointers to optional machine specific functions
  */
@@ -89,6 +94,16 @@ void arch_cpu_idle(void)
 	cpu_do_idle();
 	local_irq_enable();
 	trace_cpu_idle_rcuidle(PWR_EVENT_EXIT, smp_processor_id());
+}
+
+void arch_cpu_idle_enter(void)
+{
+	idle_notifier_call_chain(IDLE_START);
+}
+
+void arch_cpu_idle_exit(void)
+{
+	idle_notifier_call_chain(IDLE_END);
 }
 
 #ifdef CONFIG_HOTPLUG_CPU
@@ -206,6 +221,83 @@ static void print_pstate(struct pt_regs *regs)
 	}
 }
 
+/*
+ * dump a block of kernel memory from around the given address
+ */
+static void __show_data(unsigned long addr, int nbytes, const char *name, unsigned long base_addr)
+{
+	int	i, j;
+	int	nlines;
+	u32	*p;
+	unsigned long page_address;
+	const unsigned long page_mask = ~(PAGE_SIZE - 0x1);
+
+	if (!base_addr)
+		page_address = 0x0;
+	else
+		page_address = base_addr & page_mask;
+
+	/*
+	 * don't attempt to dump non-kernel addresses or
+	 * values that are probably just small negative numbers
+	 */
+	if (addr < KIMAGE_VADDR || addr > -256UL)
+		return;
+
+	printk(KERN_DEBUG "\n%s: %#lx:\n", name, addr);
+
+	/*
+	 * round address down to a 32 bit boundary
+	 * and always dump a multiple of 32 bytes
+	 */
+	p = (u32 *)(addr & ~(sizeof(u32) - 1));
+	nbytes += (addr & (sizeof(u32) - 1));
+	nlines = (nbytes + 31) / 32;
+
+
+	for (i = 0; i < nlines; i++) {
+		/*
+		 * just display low 16 bits of address to keep
+		 * each line of the dump < 80 characters
+		 */
+		printk(KERN_DEBUG "%04lx ", (unsigned long)p & 0xffff);
+		for (j = 0; j < 8; j++) {
+			u32	data;
+
+			if (page_address && page_address != (page_mask & (uintptr_t)p))
+				pr_cont(" ????????");
+			else if (probe_kernel_address(p, data))
+				pr_cont(" ********");
+			else
+				pr_cont(" %08x", data);
+			++p;
+		}
+		pr_cont("\n");
+	}
+}
+
+static void show_data(unsigned long addr, int nbytes, const char *name)
+{
+	__show_data(addr, nbytes, name, 0);
+}
+
+static void show_extra_register_data(struct pt_regs *regs, int nbytes)
+{
+	mm_segment_t fs;
+	unsigned int i;
+
+	fs = get_fs();
+	set_fs(KERNEL_DS);
+	show_data(regs->sp - nbytes, nbytes * 2, "SP");
+	for (i = 0; i < 30; i++) {
+		char name[4];
+
+		snprintf(name, sizeof(name), "X%u", i);
+		__show_data(regs->regs[i] - nbytes, nbytes * 2, name, regs->regs[i]);
+	}
+	set_fs(fs);
+}
+
 void __show_regs(struct pt_regs *regs)
 {
 	int i, top_reg;
@@ -247,6 +339,10 @@ void __show_regs(struct pt_regs *regs)
 
 		pr_cont("\n");
 	}
+
+	if (!user_mode(regs))
+		show_extra_register_data(regs, 128);
+
 }
 
 void show_regs(struct pt_regs * regs)
@@ -321,6 +417,28 @@ int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
 
 asmlinkage void ret_from_fork(void) asm("ret_from_fork");
 
+#ifdef CONFIG_CFP_ROPP
+static inline void ropp_change_key(struct task_struct *p)
+{
+#ifdef CONFIG_CFP_ROPP_SYSREGKEY
+	task_thread_info(p)->rrk = get_random_long() | RRK_MASK;
+
+#ifdef SYSREG_DEBUG
+	task_thread_info(p)->rrk = ropp_fixed_key ^ ropp_master_key;
+#endif
+
+#elif defined CONFIG_CFP_ROPP_RANDKEY
+	task_thread_info(p)->rrk = get_random_long();
+#elif defined CONFIG_CFP_ROPP_FIXKEY
+	task_thread_info(p)->rrk = ropp_fixed_key;
+#elif defined CONFIG_CFP_ROPP_ZEROKEY
+	task_thread_info(p)->rrk = 0x0;
+#else
+	#error "Please choose one ROPP key scheme"
+#endif
+}
+#endif
+
 int copy_thread(unsigned long clone_flags, unsigned long stack_start,
 		unsigned long stk_sz, struct task_struct *p)
 {
@@ -373,6 +491,9 @@ int copy_thread(unsigned long clone_flags, unsigned long stack_start,
 		p->thread.cpu_context.x19 = stack_start;
 		p->thread.cpu_context.x20 = stk_sz;
 	}
+#ifdef CONFIG_CFP_ROPP
+	ropp_change_key(p);
+#endif
 	p->thread.cpu_context.pc = (unsigned long)ret_from_fork;
 	p->thread.cpu_context.sp = (unsigned long)childregs;
 

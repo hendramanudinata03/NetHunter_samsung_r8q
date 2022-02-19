@@ -89,8 +89,21 @@ if INET
 source "net/ipv4/Kconfig"
 source "net/ipv6/Kconfig"
 source "net/netlabel/Kconfig"
+#ifdef CONFIG_MPTCP
+	source "net/mptcp/Kconfig"
+#endif
+
+config NET_ANALYTICS
+	bool
+	default y
 
 endif # if INET
+
+config ANDROID_PARANOID_NETWORK
+	bool "Only allow certain groups to create sockets"
+	default y
+	help
+		none
 
 config NETWORK_SECMARK
 	bool "Security Marking"
@@ -236,6 +249,9 @@ source "net/switchdev/Kconfig"
 source "net/l3mdev/Kconfig"
 source "net/qrtr/Kconfig"
 source "net/ncsi/Kconfig"
+# SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA {
+source "net/ncm/Kconfig"
+# SEC_PRODUCT_FEATURE_KNOX_SUPPORT_NPA }
 
 config RPS
 	bool
@@ -320,6 +336,15 @@ config NET_FLOW_LIMIT
 	  maintain capacity for the other flows. This feature provides servers
 	  with many clients some protection against DoS by a single (spoofed)
 	  flow that greatly exceeds average workload.
+
+config SOCKEV_NLMCAST
+	bool "Enable SOCKEV Netlink Multicast"
+	default n
+	help
+	  Default client for SOCKEV notifier events. Sends multicast netlink
+	  messages whenever the socket event notifier is invoked. Enable if
+	  user space entities need to be notified of socket events without
+	  having to poll /proc
 
 menu "Network testing"
 

@@ -279,7 +279,11 @@ int __scsi_execute(struct scsi_device *sdev, const unsigned char *cmd,
 	rq->cmd_len = COMMAND_SIZE(cmd[0]);
 	memcpy(rq->cmd, cmd, rq->cmd_len);
 	rq->retries = retries;
-	req->timeout = timeout;
+	if (likely(!sdev->timeout_override))
+		req->timeout = timeout;
+	else
+		req->timeout = sdev->timeout_override;
+
 	req->cmd_flags |= flags;
 	req->rq_flags |= rq_flags | RQF_QUIET;
 
@@ -1513,6 +1517,48 @@ static void scsi_unprep_fn(struct request_queue *q, struct request *req)
 	scsi_uninit_cmd(blk_mq_rq_to_pdu(req));
 }
 
+#ifdef CONFIG_BLK_TURBO_WRITE
+static void scsi_tw_try_on_fn(struct request_queue *q)
+{
+	struct scsi_device *sdev = q->queuedata;
+	struct Scsi_Host *shost = sdev->host;
+
+        if(shost->hostt->tw_ctrl)
+                shost->hostt->tw_ctrl(sdev, 1);
+}
+
+static void scsi_tw_try_off_fn(struct request_queue *q)
+{
+	struct scsi_device *sdev = q->queuedata;
+	struct Scsi_Host *shost = sdev->host;
+
+        if(shost->hostt->tw_ctrl)
+		shost->hostt->tw_ctrl(sdev, 0);
+}
+
+void scsi_reset_tw_state(struct Scsi_Host *shost)
+{
+	struct scsi_device *sdev;
+
+	shost_for_each_device(sdev, shost) {
+		if (sdev->support_tw_lu)
+			blk_reset_tw_state(sdev->request_queue);
+	}
+}
+EXPORT_SYMBOL(scsi_reset_tw_state);
+
+void scsi_alloc_tw(struct scsi_device *sdev)
+{
+	if (sdev->support_tw_lu) {
+		blk_alloc_turbo_write(sdev->request_queue);
+		blk_register_tw_try_on_fn(sdev->request_queue, scsi_tw_try_on_fn);
+		blk_register_tw_try_off_fn(sdev->request_queue, scsi_tw_try_off_fn);
+		printk(KERN_INFO "%s: register scsi ufs tw interface for LU %d\n",
+				__func__, (int)sdev->lun);
+	}
+}
+#endif
+
 /*
  * scsi_dev_queue_ready: if we can send requests to sdev, return 1 else
  * return 0.
@@ -2467,6 +2513,33 @@ void scsi_unblock_requests(struct Scsi_Host *shost)
 	scsi_run_host_queues(shost);
 }
 EXPORT_SYMBOL(scsi_unblock_requests);
+
+/*
+ * Function:    scsi_set_cmd_timeout_override()
+ *
+ * Purpose:     Utility function used by low-level drivers to override
+		timeout for the scsi commands.
+ *
+ * Arguments:   sdev       - scsi device in question
+ *		timeout	   - timeout in jiffies
+ *
+ * Returns:     Nothing
+ *
+ * Lock status: No locks are assumed held.
+ *
+ * Notes:	Some platforms might be very slow and command completion may
+ *		take much longer than default scsi command timeouts.
+ *		SCSI Read/Write command timeout can be changed by
+ *		blk_queue_rq_timeout() but there is no option to override
+ *		timeout for rest of the scsi commands. This function would
+ *		would allow this.
+ */
+void scsi_set_cmd_timeout_override(struct scsi_device *sdev,
+				   unsigned int timeout)
+{
+	sdev->timeout_override = timeout;
+}
+EXPORT_SYMBOL(scsi_set_cmd_timeout_override);
 
 int __init scsi_init_queue(void)
 {

@@ -178,6 +178,7 @@ enum {
 
 #define SWAP_CLUSTER_MAX 32UL
 #define COMPACT_CLUSTER_MAX SWAP_CLUSTER_MAX
+#define SWAPFILE_CLUSTER	256
 
 #define SWAP_MAP_MAX	0x3e	/* Max duplication count, in first swap_map */
 #define SWAP_MAP_BAD	0x3f	/* Note pageblock is bad, in first swap_map */
@@ -348,8 +349,14 @@ extern void deactivate_file_page(struct page *page);
 extern void mark_page_lazyfree(struct page *page);
 extern void swap_setup(void);
 
-extern void lru_cache_add_active_or_unevictable(struct page *page,
-						struct vm_area_struct *vma);
+extern void __lru_cache_add_active_or_unevictable(struct page *page,
+						unsigned long vma_flags);
+
+static inline void lru_cache_add_active_or_unevictable(struct page *page,
+						struct vm_area_struct *vma)
+{
+	return __lru_cache_add_active_or_unevictable(page, vma->vm_flags);
+}
 
 /* linux/mm/vmscan.c */
 extern unsigned long zone_reclaimable_pages(struct zone *zone);
@@ -366,6 +373,8 @@ extern unsigned long mem_cgroup_shrink_node(struct mem_cgroup *mem,
 						unsigned long *nr_scanned);
 extern unsigned long shrink_all_memory(unsigned long nr_pages);
 extern int vm_swappiness;
+extern int sysctl_swap_ratio;
+extern int sysctl_swap_ratio_enable;
 extern int remove_mapping(struct address_space *mapping, struct page *page);
 extern unsigned long vm_total_pages;
 
@@ -382,6 +391,11 @@ extern void check_move_unevictable_pages(struct page **, int nr_pages);
 
 extern int kswapd_run(int nid);
 extern void kswapd_stop(int nid);
+#ifdef CONFIG_KSWAPD_PERFTUNE
+extern int kswapd_perftune_cpumask;
+int sysctl_kswapd_perftune_cpumask_handler(struct ctl_table *table, int write,
+			void __user *buffer, size_t *length, loff_t *ppos);
+#endif
 
 #ifdef CONFIG_SWAP
 
@@ -475,6 +489,8 @@ extern int try_to_free_swap(struct page *);
 struct backing_dev_info;
 extern int init_swap_address_space(unsigned int type, unsigned long nr_pages);
 extern void exit_swap_address_space(unsigned int type);
+extern unsigned long get_swap_orig_data_nrpages(void);
+extern unsigned long get_swap_comp_pool_nrpages(void);
 
 #else /* CONFIG_SWAP */
 
@@ -621,7 +637,7 @@ static inline int split_swap_cluster(swp_entry_t entry)
 }
 #endif
 
-#ifdef CONFIG_MEMCG
+#if defined(CONFIG_MEMCG) && !defined(CONFIG_MEMCG_FORCE_USE_VM_SWAPPINESS)
 static inline int mem_cgroup_swappiness(struct mem_cgroup *memcg)
 {
 	/* Cgroup2 doesn't have per-cgroup swappiness */

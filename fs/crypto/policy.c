@@ -43,6 +43,10 @@ static bool fscrypt_valid_enc_modes(u32 contents_mode, u32 filenames_mode)
 	    filenames_mode == FSCRYPT_MODE_ADIANTUM)
 		return true;
 
+	if (contents_mode == FSCRYPT_MODE_PRIVATE &&
+	    filenames_mode == FSCRYPT_MODE_AES_256_CTS)
+		return true;
+
 	return false;
 }
 
@@ -66,18 +70,14 @@ static bool supported_direct_key_modes(const struct inode *inode,
 	return true;
 }
 
-static bool supported_iv_ino_lblk_64_policy(
-					const struct fscrypt_policy_v2 *policy,
-					const struct inode *inode)
+static bool supported_iv_ino_lblk_policy(const struct fscrypt_policy_v2 *policy,
+					 const struct inode *inode,
+					 const char *type,
+					 int max_ino_bits, int max_lblk_bits)
 {
 	struct super_block *sb = inode->i_sb;
 	int ino_bits = 64, lblk_bits = 64;
 
-	if (policy->flags & FSCRYPT_POLICY_FLAG_DIRECT_KEY) {
-		fscrypt_warn(inode,
-			     "The DIRECT_KEY and IV_INO_LBLK_64 flags are mutually exclusive");
-		return false;
-	}
 	/*
 	 * It's unsafe to include inode numbers in the IVs if the filesystem can
 	 * potentially renumber inodes, e.g. via filesystem shrinking.
@@ -85,16 +85,22 @@ static bool supported_iv_ino_lblk_64_policy(
 	if (!sb->s_cop->has_stable_inodes ||
 	    !sb->s_cop->has_stable_inodes(sb)) {
 		fscrypt_warn(inode,
-			     "Can't use IV_INO_LBLK_64 policy on filesystem '%s' because it doesn't have stable inode numbers",
-			     sb->s_id);
+			     "Can't use %s policy on filesystem '%s' because it doesn't have stable inode numbers",
+			     type, sb->s_id);
 		return false;
 	}
 	if (sb->s_cop->get_ino_and_lblk_bits)
 		sb->s_cop->get_ino_and_lblk_bits(sb, &ino_bits, &lblk_bits);
-	if (ino_bits > 32 || lblk_bits > 32) {
+	if (ino_bits > max_ino_bits) {
 		fscrypt_warn(inode,
-			     "Can't use IV_INO_LBLK_64 policy on filesystem '%s' because it doesn't use 32-bit inode and block numbers",
-			     sb->s_id);
+			     "Can't use %s policy on filesystem '%s' because its inode numbers are too long",
+			     type, sb->s_id);
+		return false;
+	}
+	if (lblk_bits > max_lblk_bits) {
+		fscrypt_warn(inode,
+			     "Can't use %s policy on filesystem '%s' because its block numbers are too long",
+			     type, sb->s_id);
 		return false;
 	}
 	return true;
@@ -137,6 +143,8 @@ static bool fscrypt_supported_v1_policy(const struct fscrypt_policy_v1 *policy,
 static bool fscrypt_supported_v2_policy(const struct fscrypt_policy_v2 *policy,
 					const struct inode *inode)
 {
+	int count = 0;
+
 	if (!fscrypt_valid_enc_modes(policy->contents_encryption_mode,
 				     policy->filenames_encryption_mode)) {
 		fscrypt_warn(inode,
@@ -152,13 +160,29 @@ static bool fscrypt_supported_v2_policy(const struct fscrypt_policy_v2 *policy,
 		return false;
 	}
 
+	count += !!(policy->flags & FSCRYPT_POLICY_FLAG_DIRECT_KEY);
+	count += !!(policy->flags & FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64);
+	count += !!(policy->flags & FSCRYPT_POLICY_FLAG_IV_INO_LBLK_32);
+	if (count > 1) {
+		fscrypt_warn(inode, "Mutually exclusive encryption flags (0x%02x)",
+			     policy->flags);
+		return false;
+	}
+
 	if ((policy->flags & FSCRYPT_POLICY_FLAG_DIRECT_KEY) &&
 	    !supported_direct_key_modes(inode, policy->contents_encryption_mode,
 					policy->filenames_encryption_mode))
 		return false;
 
 	if ((policy->flags & FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64) &&
-	    !supported_iv_ino_lblk_64_policy(policy, inode))
+	    !supported_iv_ino_lblk_policy(policy, inode, "IV_INO_LBLK_64",
+					  32, 32))
+		return false;
+
+	if ((policy->flags & FSCRYPT_POLICY_FLAG_IV_INO_LBLK_32) &&
+	    /* This uses hashed inode numbers, so ino_bits doesn't matter. */
+	    !supported_iv_ino_lblk_policy(policy, inode, "IV_INO_LBLK_32",
+					  INT_MAX, 32))
 		return false;
 
 	if (memchr_inv(policy->__reserved, 0, sizeof(policy->__reserved))) {
@@ -219,6 +243,10 @@ static int fscrypt_new_context_from_policy(union fscrypt_context *ctx_u,
 		       policy->master_key_descriptor,
 		       sizeof(ctx->master_key_descriptor));
 		get_random_bytes(ctx->nonce, sizeof(ctx->nonce));
+
+#if defined(CONFIG_FSCRYPT_SDP) || defined(CONFIG_DDAR)
+		ctx->knox_flags = 0;
+#endif
 		return sizeof(*ctx);
 	}
 	case FSCRYPT_POLICY_V2: {
@@ -235,6 +263,10 @@ static int fscrypt_new_context_from_policy(union fscrypt_context *ctx_u,
 		       policy->master_key_identifier,
 		       sizeof(ctx->master_key_identifier));
 		get_random_bytes(ctx->nonce, sizeof(ctx->nonce));
+
+#if defined(CONFIG_FSCRYPT_SDP) || defined(CONFIG_DDAR)
+		ctx->knox_flags = 0;
+#endif
 		return sizeof(*ctx);
 	}
 	}
@@ -258,7 +290,7 @@ int fscrypt_policy_from_context(union fscrypt_policy *policy_u,
 {
 	memset(policy_u, 0, sizeof(*policy_u));
 
-	if (ctx_size <= 0 || ctx_size != fscrypt_context_size(ctx_u))
+	if (!fscrypt_context_is_valid(ctx_u, ctx_size))
 		return -EINVAL;
 
 	switch (ctx_u->version) {
@@ -354,6 +386,9 @@ static int set_encryption_policy(struct inode *inode,
 					       policy->v2.master_key_identifier);
 		if (err)
 			return err;
+		if (policy->v2.flags & FSCRYPT_POLICY_FLAG_IV_INO_LBLK_32)
+			pr_warn_once("%s (pid %d) is setting an IV_INO_LBLK_32 encryption policy.  This should only be used if there are certain hardware limitations.\n",
+				     current->comm, current->pid);
 		break;
 	default:
 		WARN_ON(1);
@@ -378,8 +413,11 @@ int fscrypt_ioctl_set_policy(struct file *filp, const void __user *arg)
 		return -EFAULT;
 
 	size = fscrypt_policy_size(&policy);
-	if (size <= 0)
+	if (size <= 0) {
+		printk(KERN_ERR
+			"fscrypt_ioctl_set_policy policy.version != 0\n");
 		return -EINVAL;
+	}
 
 	/*
 	 * We should just copy the remaining 'size - 1' bytes here, but a
@@ -393,12 +431,18 @@ int fscrypt_ioctl_set_policy(struct file *filp, const void __user *arg)
 	 * Work around it by just copying the first byte again...
 	 */
 	version = policy.version;
-	if (copy_from_user(&policy, arg, size))
+	if (copy_from_user(&policy, arg, size)) {
+		printk(KERN_ERR
+			"fscrypt_ioctl_set_policy copy_from_user failed\n");
 		return -EFAULT;
+	}
 	policy.version = version;
 
-	if (!inode_owner_or_capable(inode))
+	if (!inode_owner_or_capable(inode)) {
+		printk(KERN_ERR
+			"fscrypt_ioctl_set_policy inode_owner_or_capable failed\n");
 		return -EACCES;
+	}
 
 	ret = mnt_want_write_file(filp);
 	if (ret)
@@ -426,6 +470,8 @@ int fscrypt_ioctl_set_policy(struct file *filp, const void __user *arg)
 	inode_unlock(inode);
 
 	mnt_drop_write_file(filp);
+	pr_info("fscrypt_ioctl_set_policy : %s(%d)\n",
+			(filp ?(char *)filp->f_path.dentry->d_name.name : (char *)"Unknown"), ret);
 	return ret;
 }
 EXPORT_SYMBOL(fscrypt_ioctl_set_policy);
@@ -480,6 +526,25 @@ int fscrypt_ioctl_get_policy_ex(struct file *filp, void __user *uarg)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(fscrypt_ioctl_get_policy_ex);
+
+/* FS_IOC_GET_ENCRYPTION_NONCE: retrieve file's encryption nonce for testing */
+int fscrypt_ioctl_get_nonce(struct file *filp, void __user *arg)
+{
+	struct inode *inode = file_inode(filp);
+	union fscrypt_context ctx;
+	int ret;
+
+	ret = inode->i_sb->s_cop->get_context(inode, &ctx, sizeof(ctx));
+	if (ret < 0)
+		return ret;
+	if (!fscrypt_context_is_valid(&ctx, ret))
+		return -EINVAL;
+	if (copy_to_user(arg, fscrypt_context_nonce(&ctx),
+			 FS_KEY_DERIVATION_NONCE_SIZE))
+		return -EFAULT;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(fscrypt_ioctl_get_nonce);
 
 /**
  * fscrypt_has_permitted_context() - is a file's encryption policy permitted
@@ -580,6 +645,24 @@ int fscrypt_inherit_context(struct inode *parent, struct inode *child,
 	ctxsize = fscrypt_new_context_from_policy(&ctx, &ci->ci_policy);
 
 	BUILD_BUG_ON(sizeof(ctx) != FSCRYPT_SET_CONTEXT_MAX_SIZE);
+
+#ifdef CONFIG_DDAR
+	res = dd_test_and_inherit_context(&ctx, parent, child, ci, fs_data);
+	if(res) {
+		dd_error("failed to inherit dd policy\n");
+		return res;
+	}
+#endif
+
+#ifdef CONFIG_FSCRYPT_SDP
+	res = fscrypt_sdp_inherit_context(parent, child, &ctx, fs_data);
+	if (res) {
+		printk_once(KERN_WARNING
+				"%s: Failed to set sensitive ongoing flag (err:%d)\n", __func__, res);
+		return res;
+	}
+#endif
+
 	res = parent->i_sb->s_cop->set_context(child, &ctx, ctxsize, fs_data);
 	if (res)
 		return res;

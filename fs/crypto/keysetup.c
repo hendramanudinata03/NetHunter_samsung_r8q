@@ -47,7 +47,16 @@ struct fscrypt_mode fscrypt_modes[] = {
 		.ivsize = 32,
 		.blk_crypto_mode = BLK_ENCRYPTION_MODE_ADIANTUM,
 	},
+	[FSCRYPT_MODE_PRIVATE] = {
+		.friendly_name = "ice",
+		.cipher_str = "xts(aes)",
+		.keysize = 64,
+		.ivsize = 16,
+		.blk_crypto_mode = BLK_ENCRYPTION_MODE_AES_256_XTS,
+	},
 };
+
+static DEFINE_MUTEX(fscrypt_mode_key_setup_mutex);
 
 static struct fscrypt_mode *
 select_encryption_mode(const union fscrypt_policy *policy,
@@ -179,7 +188,7 @@ static int setup_per_mode_enc_key(struct fscrypt_info *ci,
 		return 0;
 	}
 
-	mutex_lock(&mode_key_setup_mutex);
+	mutex_lock(&fscrypt_mode_key_setup_mutex);
 
 	if (fscrypt_is_key_prepared(prep_key, ci))
 		goto done_unlock;
@@ -230,7 +239,7 @@ done_unlock:
 	ci->ci_key = *prep_key;
 	err = 0;
 out_unlock:
-	mutex_unlock(&mode_key_setup_mutex);
+	mutex_unlock(&fscrypt_mode_key_setup_mutex);
 	return err;
 }
 
@@ -249,15 +258,53 @@ int fscrypt_derive_dirhash_key(struct fscrypt_info *ci,
 	return 0;
 }
 
+static int fscrypt_setup_iv_ino_lblk_32_key(struct fscrypt_info *ci,
+					    struct fscrypt_master_key *mk)
+{
+	int err;
+
+	err = setup_per_mode_enc_key(ci, mk, mk->mk_iv_ino_lblk_32_keys,
+				     HKDF_CONTEXT_IV_INO_LBLK_32_KEY, true);
+	if (err)
+		return err;
+
+	/* pairs with smp_store_release() below */
+	if (!smp_load_acquire(&mk->mk_ino_hash_key_initialized)) {
+
+		mutex_lock(&fscrypt_mode_key_setup_mutex);
+
+		if (mk->mk_ino_hash_key_initialized)
+			goto unlock;
+
+		err = fscrypt_hkdf_expand(&mk->mk_secret.hkdf,
+					  HKDF_CONTEXT_INODE_HASH_KEY, NULL, 0,
+					  (u8 *)&mk->mk_ino_hash_key,
+					  sizeof(mk->mk_ino_hash_key));
+		if (err)
+			goto unlock;
+		/* pairs with smp_load_acquire() above */
+		smp_store_release(&mk->mk_ino_hash_key_initialized, true);
+unlock:
+		mutex_unlock(&fscrypt_mode_key_setup_mutex);
+		if (err)
+			return err;
+	}
+
+	ci->ci_hashed_ino = (u32)siphash_1u64(ci->ci_inode->i_ino,
+					      &mk->mk_ino_hash_key);
+	return 0;
+}
+
 static int fscrypt_setup_v2_file_key(struct fscrypt_info *ci,
 				     struct fscrypt_master_key *mk)
 {
 	int err;
 
 	if (mk->mk_secret.is_hw_wrapped &&
-	    !(ci->ci_policy.v2.flags & FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64)) {
+	    !(ci->ci_policy.v2.flags & (FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64 |
+					FSCRYPT_POLICY_FLAG_IV_INO_LBLK_32))) {
 		fscrypt_warn(ci->ci_inode,
-			     "Hardware-wrapped keys are only supported with IV_INO_LBLK_64 policies");
+			     "Hardware-wrapped keys are only supported with IV_INO_LBLK policies");
 		return -EINVAL;
 	}
 
@@ -278,11 +325,14 @@ static int fscrypt_setup_v2_file_key(struct fscrypt_info *ci,
 		 * IV_INO_LBLK_64: encryption keys are derived from (master_key,
 		 * mode_num, filesystem_uuid), and inode number is included in
 		 * the IVs.  This format is optimized for use with inline
-		 * encryption hardware compliant with the UFS or eMMC standards.
+		 * encryption hardware compliant with the UFS standard.
 		 */
 		err = setup_per_mode_enc_key(ci, mk, mk->mk_iv_ino_lblk_64_keys,
 					     HKDF_CONTEXT_IV_INO_LBLK_64_KEY,
 					     true);
+	} else if (ci->ci_policy.v2.flags &
+		   FSCRYPT_POLICY_FLAG_IV_INO_LBLK_32) {
+		err = fscrypt_setup_iv_ino_lblk_32_key(ci, mk);
 	} else {
 		u8 derived_key[FSCRYPT_MAX_KEY_SIZE];
 
@@ -328,8 +378,6 @@ static int setup_file_encryption_key(struct fscrypt_info *ci,
 	struct fscrypt_key_specifier mk_spec;
 	int err;
 
-	fscrypt_select_encryption_impl(ci);
-
 	switch (ci->ci_policy.version) {
 	case FSCRYPT_POLICY_V1:
 		mk_spec.type = FSCRYPT_KEY_SPEC_TYPE_DESCRIPTOR;
@@ -353,6 +401,10 @@ static int setup_file_encryption_key(struct fscrypt_info *ci,
 		if (key != ERR_PTR(-ENOKEY) ||
 		    ci->ci_policy.version != FSCRYPT_POLICY_V1)
 			return PTR_ERR(key);
+
+		err = fscrypt_select_encryption_impl(ci, false);
+		if (err)
+			return err;
 
 		/*
 		 * As a legacy fallback for v1 policies, search for the key in
@@ -388,6 +440,10 @@ static int setup_file_encryption_key(struct fscrypt_info *ci,
 		goto out_release_key;
 	}
 
+	err = fscrypt_select_encryption_impl(ci, mk->mk_secret.is_hw_wrapped);
+	if (err)
+		goto out_release_key;
+
 	switch (ci->ci_policy.version) {
 	case FSCRYPT_POLICY_V1:
 		err = fscrypt_setup_v1_file_key(ci, mk->mk_secret.raw);
@@ -412,6 +468,22 @@ out_release_key:
 	return err;
 }
 
+#ifdef CONFIG_FSCRYPT_SDP
+static void fscrypt_sdp_finalize(struct fscrypt_info *ci)
+{
+	if (!ci || !ci->ci_sdp_info || ci->ci_sdp_info->sdp_flags & SDP_IS_DIRECTORY)
+		return;
+
+	switch (ci->ci_policy.version) {
+	case FSCRYPT_POLICY_V1:
+		fscrypt_sdp_finalize_v1(ci);
+		break;
+	default:
+		break;
+	}
+}
+#endif
+
 static void put_crypt_info(struct fscrypt_info *ci)
 {
 	struct key *key;
@@ -419,11 +491,28 @@ static void put_crypt_info(struct fscrypt_info *ci)
 	if (!ci)
 		return;
 
+#ifdef CONFIG_DDAR
+	dd_info_try_free(ci->ci_dd_info);
+#endif
+
+#ifdef CONFIG_FSCRYPT_SDP
+	fscrypt_sdp_put_sdp_info(ci->ci_sdp_info);
+#endif
+
 	if (ci->ci_direct_key)
 		fscrypt_put_direct_key(ci->ci_direct_key);
-	else if (ci->ci_owns_key)
-		fscrypt_destroy_prepared_key(&ci->ci_key);
-
+	else if (ci->ci_owns_key) {
+		if (fscrypt_policy_contents_mode(&ci->ci_policy) !=
+		    FSCRYPT_MODE_PRIVATE) {
+			fscrypt_destroy_prepared_key(&ci->ci_key);
+		} else {
+			crypto_free_skcipher(ci->ci_key.tfm);
+#ifdef CONFIG_FS_ENCRYPTION_INLINE_CRYPT
+			if (ci->ci_key.blk_key)
+				kzfree(ci->ci_key.blk_key);
+#endif
+		}
+	}
 	key = ci->ci_master_key;
 	if (key) {
 		struct fscrypt_master_key *mk = key->payload.data[0];
@@ -454,9 +543,19 @@ int fscrypt_get_encryption_info(struct inode *inode)
 	struct fscrypt_mode *mode;
 	struct key *master_key = NULL;
 	int res;
+#if defined(CONFIG_FSCRYPT_SDP) || defined(CONFIG_DDAR)
+	u32 knox_flags;
+#endif
 
-	if (fscrypt_has_encryption_key(inode))
+	if (fscrypt_has_encryption_key(inode)) {
+#ifdef CONFIG_DDAR
+		if (fscrypt_dd_encrypted_inode(inode) && fscrypt_dd_is_locked()) {
+			dd_error("Failed to open a DDAR-protected file in lock state (ino:%ld)\n", inode->i_ino);
+			return -ENOKEY;
+		}
+#endif
 		return 0;
+	}
 
 	res = fscrypt_initialize(inode->i_sb->s_cop->flags);
 	if (res)
@@ -494,20 +593,32 @@ int fscrypt_get_encryption_info(struct inode *inode)
 		goto out;
 	}
 
+	memcpy(crypt_info->ci_nonce, fscrypt_context_nonce(&ctx),
+	       FS_KEY_DERIVATION_NONCE_SIZE);
+
+	// SDP_R_PORTING : to refine switch case as fscrypt_context_nonce.
+#if defined(CONFIG_FSCRYPT_SDP) || defined(CONFIG_DDAR)
 	switch (ctx.version) {
 	case FSCRYPT_CONTEXT_V1:
-		memcpy(crypt_info->ci_nonce, ctx.v1.nonce,
-		       FS_KEY_DERIVATION_NONCE_SIZE);
+		knox_flags = ctx.v1.knox_flags;
 		break;
 	case FSCRYPT_CONTEXT_V2:
-		memcpy(crypt_info->ci_nonce, ctx.v2.nonce,
-		       FS_KEY_DERIVATION_NONCE_SIZE);
+		knox_flags = ctx.v2.knox_flags;
 		break;
 	default:
 		WARN_ON(1);
 		res = -EINVAL;
 		goto out;
 	}
+#endif
+
+#ifdef CONFIG_DDAR
+	crypt_info->ci_dd_info = NULL;
+#endif
+
+#ifdef CONFIG_FSCRYPT_SDP
+	crypt_info->ci_sdp_info = NULL;
+#endif
 
 	if (!fscrypt_supported_policy(&crypt_info->ci_policy, inode)) {
 		res = -EINVAL;
@@ -522,9 +633,37 @@ int fscrypt_get_encryption_info(struct inode *inode)
 	WARN_ON(mode->ivsize > FSCRYPT_MAX_IV_SIZE);
 	crypt_info->ci_mode = mode;
 
+#ifdef CONFIG_FSCRYPT_SDP
+	if ((FSCRYPT_SDP_PARSE_FLAG_SDP_ONLY(knox_flags) & FSCRYPT_KNOX_FLG_SDP_MASK)) {
+		crypt_info->ci_sdp_info = fscrypt_sdp_alloc_sdp_info();
+		if (!crypt_info->ci_sdp_info) {
+			res = -ENOMEM;
+			goto out;
+		}
+
+		res = fscrypt_sdp_update_sdp_info(inode, &ctx, crypt_info);
+		if (res)
+			goto out;
+	}
+#endif
+
 	res = setup_file_encryption_key(crypt_info, &master_key);
 	if (res)
 		goto out;
+
+#ifdef CONFIG_DDAR
+	if (fscrypt_dd_flg_enabled(knox_flags)) {
+		struct dd_info *di = alloc_dd_info(inode);
+		if (IS_ERR(di)) {
+			dd_error("%s - failed to alloc dd_info(%d)\n", __func__, __LINE__);
+			res = PTR_ERR(di);
+
+			goto out;
+		}
+
+		crypt_info->ci_dd_info = di;
+	}
+#endif
 
 	if (cmpxchg_release(&inode->i_crypt_info, NULL, crypt_info) == NULL) {
 		if (master_key) {
@@ -540,6 +679,17 @@ int fscrypt_get_encryption_info(struct inode *inode)
 		}
 		crypt_info = NULL;
 	}
+#ifdef CONFIG_FSCRYPT_SDP
+	if (crypt_info == NULL) //Call only when i_crypt_info is loaded initially
+		fscrypt_sdp_finalize(inode->i_crypt_info);
+#endif
+#ifdef CONFIG_DDAR
+	if (crypt_info == NULL) {
+		if (inode->i_crypt_info && inode->i_crypt_info->ci_dd_info) {
+			fscrypt_dd_inc_count();
+		}
+	}
+#endif
 	res = 0;
 out:
 	if (master_key) {
@@ -563,6 +713,15 @@ EXPORT_SYMBOL(fscrypt_get_encryption_info);
  */
 void fscrypt_put_encryption_info(struct inode *inode)
 {
+#ifdef CONFIG_DDAR
+	if (inode->i_crypt_info && inode->i_crypt_info->ci_dd_info) {
+		fscrypt_dd_dec_count();
+	}
+#endif
+
+#ifdef CONFIG_FSCRYPT_SDP
+	fscrypt_sdp_cache_remove_inode_num(inode);
+#endif
 	put_crypt_info(inode->i_crypt_info);
 	inode->i_crypt_info = NULL;
 }
